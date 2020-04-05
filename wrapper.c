@@ -1,25 +1,110 @@
-#include "item_cmd.h"
-#include<xjr-node.h>
-#include<xjr-helpers.h>
-#include <unistd.h>
-#include <fcntl.h>
+#include<unistd.h>
+#include<fcntl.h>
 #include<string.h>
-#include <sys/wait.h>
+#include<sys/wait.h>
+#include<stdlib.h>
+#include<stdio.h>
+//#include<zmq.h> 
 
-cmd_res *run_cmd( char **args, int argLen, long int *inLen, char *in ) {
+char **shift_args( char *argsIn[], int count, int shift );
+void run_cmd( void *sock, char **args, int argLen, long int *inLen, char *in );
+void free_args( char **args, int argLen );
+
+int main( int argc, char *argv[] ) {
+    //void *sock = init_zmq( argv[0] );
+    void *sock = NULL;
+    
+    char **newArgs = shift_args( argv, argc, 1 );
+    run_cmd( sock, newArgs, argc-1, 0, NULL );
+    
+    free( newArgs );
+    //free_args( newArgs, argc-1 );
+    return 0;
+}
+
+void *init_zmq( char *spec ) {
+    /*void *ctx = zmq_ctx_new();
+    void *sock = zmq_socket( ctx, ZMQ_PUSH );
+    int rc = zmq_connect( sock, spec ); //"tcp://*:5555" );
+    if( rc != 0 ) {
+        fprintf( stderr, "Cannot open zmq socket to send output" );
+        exit(1);
+    }
+    return sock;*/
+    return NULL;
+}
+
+void send_line( char *buffer, int len ) {
+    printf( "Line[%.*s]\n", len, buffer );
+}
+
+void send_lines( int type, void *sock, char **outPtr, int *outPos, int *outSize, int *increase ) {
+    char *out = *outPtr;
+    // assume unix line endings 0x0a ( CR )
+    int start = *outPos;
+    int end = *outPos + *increase;
+    int lineStart = 0;
+    int sent = 0;
+    for( int i=start;i<=end;i++ ) {
+        char let = out[ i ];
+        //printf("let:%c - %x\n", let, let );
+        if( let == 0x0a ) {
+            int lineLen = i - lineStart;
+            send_line( out + lineStart, i - lineStart );
+            lineStart = i+1;
+            sent += lineLen + 1; // +1 to include the CR
+            continue;
+        }
+    }
+    // shift all the sent data
+    int left = end - sent;
+    if( left == 0 ) {
+        *outPos = 0;
+        *increase = 0;
+        return;
+    }
+    if( left < sent ) {
+        // small enough to just copy to the start
+        memcpy( out, out + end, sent );
+        *outPos = 0;
+        *increase = 0;
+        return;
+    }
+    // we can't shift everything in one go
+    // so we'll just replace the whole buffer
+    int newsize = left;
+    if( newsize < 100 ) newsize = 100;
+    
+    char *newbuf = (char *) malloc( *outSize - sent );
+    memcpy( newbuf, out + end, left );
+    *outSize = newsize;
+    *increase = 0;
+    *outPos = left;
+    free( out );
+    *outPtr = newbuf;
+}
+
+void run_cmd( void *sock, char **args, int argLen, long int *inLen, char *in ) {
     // Run the cmd, saving the stdout and stderr of it
     int stdout_pipe[2];
-    if( pipe( stdout_pipe ) == -1 ) return NULL;
+    if( pipe( stdout_pipe ) == -1 ) {
+        fprintf(stderr, "pipe err\n");
+        return;
+    }
     int stderr_pipe[2];
-    if( pipe( stderr_pipe ) == -1 ) return NULL;
+    if( pipe( stderr_pipe ) == -1 ) {
+        fprintf(stderr, "pipe err\n");
+        return;
+    }
     
     pid_t pid;
-    if( ( pid = fork() ) == -1 ) return NULL;
+    if( ( pid = fork() ) == -1 ) return;
     
     if(pid == 0) {
         dup2( stdout_pipe[1], STDOUT_FILENO ); close( stdout_pipe[0] ); close( stdout_pipe[1] );
         dup2( stderr_pipe[1], STDERR_FILENO ); close( stderr_pipe[0] ); close( stderr_pipe[1] );
         
+        printf("Running command \"%s\" with %i arguments\n", args[0], argLen );
         execv( args[0], args );
         
         exit(1); // Should never be reached
@@ -28,15 +113,23 @@ cmd_res *run_cmd( char **args, int argLen, long int *inLen, char *in ) {
     close( stdout_pipe[1] );
     close( stderr_pipe[1] );
     
-    fcntl( stdout_pipe[0], F_SETFL, O_NONBLOCK | O_ASYNC);
-    fcntl( stderr_pipe[0], F_SETFL, O_NONBLOCK | O_ASYNC);   
+    fcntl( stdout_pipe[0], F_SETFL, O_NONBLOCK);
+    fcntl( stderr_pipe[0], F_SETFL, O_NONBLOCK);   
     
     int outSize = 100;
     int errSize = 100;
     int outPos = 0;
     int errPos = 0;
     char *out = malloc( outSize );
+    if( !out ) {
+        fprintf(stderr,"Could not allocate %i out\n", outSize );
+        exit(1);
+    }
     char *err = malloc( errSize );
+    if( !err ) {
+        fprintf(stderr, "Could not allocate %i out\n", outSize );
+        exit(1);
+    }
         
     int resCode = 1000;
     int done = 0;
@@ -44,7 +137,14 @@ cmd_res *run_cmd( char **args, int argLen, long int *inLen, char *in ) {
         // read a chunk of stdout
         int out_bytes = read( stdout_pipe[0], ( out + outPos ), outSize - outPos );
         if( out_bytes > 0 ) {
+            //printf("out ptr: %p\n", out );
+            //printf("chunk:[%.*s]\n", out_bytes, out + outPos );
+            // scan for lines, sending them and shifting the buffer when found
+            //if( outPos != outSize || *( out + outPos + out_bytes ) == 0x0d ) 
+            send_lines( 0, sock, &out, &outPos, &outSize, &out_bytes );
+                
             outPos += out_bytes;
+        
             if( outPos == outSize ) {
                 char *newbuf = malloc( outSize * 2 );
                 memcpy( newbuf, out, outSize );
@@ -56,8 +156,10 @@ cmd_res *run_cmd( char **args, int argLen, long int *inLen, char *in ) {
         
         // read a chunk of stderr
         int err_bytes = read( stderr_pipe[0], ( err + errPos ), errSize - errPos );
-        //printf("Error bytes: %i\n", err_bytes );
         if( err_bytes > 0 ) {
+            //printf("chunk:[%.*s]\n", err_bytes, err + errPos );
+            if( outPos != outSize ) send_lines( 1, sock, &err, &errPos, &errSize, &err_bytes );
+            
             errPos += err_bytes;
             if( errPos == errSize ) {
                 char *newbuf = malloc( errSize * 2 );
@@ -65,11 +167,12 @@ cmd_res *run_cmd( char **args, int argLen, long int *inLen, char *in ) {
                 free( err );
                 err = newbuf;
                 errSize *= 2;
-                //printf("New size: %i\n", errSize );
             }
         }
         
-        if( out_bytes < 1 && err_bytes < 1 && done == 1 ) done = 2;
+        if( out_bytes < 1 && err_bytes < 1 && done == 1 ) {
+            done = 2;
+        }
         
         if( !done ) {
             int status = 1111;
@@ -77,6 +180,7 @@ cmd_res *run_cmd( char **args, int argLen, long int *inLen, char *in ) {
             
             if( pid != 0 ) {
                 if( WIFEXITED( status ) ) {
+                    //printf("exited\n");
                     resCode = WEXITSTATUS( status );
                     done = 1;
                 }
@@ -93,40 +197,27 @@ cmd_res *run_cmd( char **args, int argLen, long int *inLen, char *in ) {
         if( out_bytes < 1 && err_bytes < 1 ) usleep( 10000 );
     }
     
-    cmd_res *res = calloc( sizeof( cmd_res ), 1 );
+    /*cmd_res *res = calloc( sizeof( cmd_res ), 1 );
     res->outLen = outPos;
     res->errLen = errPos;
     res->out = out;
     res->err = err;
-    res->errorLevel = resCode;
-    return res;
+    res->errorLevel = resCode;*/
+    //return res;
 }
 
-void cmd_res__delete( cmd_res *self ) {
-}
 
-int xjr_to_args( xjr_arr *argArr, int *argCount, char ***argsOut ) {
+char **shift_args( char *argsIn[], int count, int shift ) {
     char **args;
-    if( !argArr ) return 1;
-    int count = argArr->count;
-    printf("Number of arguments: %i\n", count );
-    args = malloc( sizeof( void * ) * ( count + 2 ) );
-    args[ argArr->count+1 ] = NULL;
+    count -= shift;
+    args = malloc( sizeof( void * ) * ( count + 1 ) );
+    args[ count ] = NULL;
     
     for( int i=0;i<count;i++ ) {
-        xjr_node *arg = ( xjr_node * ) argArr->items[ i ];
-        int vallen;
-        char *value = xjr_node__value( arg, &vallen );
-        char *valuez = malloc( vallen + 1 );
-        valuez[ vallen ] = 0x00;//NULL;
-        memcpy( valuez, value, vallen );
-        args[ i+1 ] = valuez;
-        printf("Argument %i: '%s'\n", i, valuez );
+        args[ i ] = argsIn[ i + shift ];
     }
-    xjr_arr__delete( argArr );
     
-    *argsOut = args;
-    return 0;
+    return args;
 }
 
 void free_args( char **args, int argLen ) {
@@ -135,63 +226,4 @@ void free_args( char **args, int argLen ) {
         free( ptr );
     }
     free( args );
-}
-
-char *form_response( int itemId, cmd_res *res ) {
-    int len = 20 + 26 + 44 + 44 + 21 // Size of template ( see below )
-                  + res->outLen // size of stdout
-                  + res->errLen // size of stderr
-                  + 20 // some extra to handle integer expansion
-                  ;
-    char *msg = malloc( len );
-    snprintf( msg, len, 
-        "<result itemId='%i'>" // 20
-        "<localvars errorCode='%i'>" // 26
-        "<stdout bytes='%li'><![CDATA[%.*s]]></stdout>" // 44
-        "<stderr bytes='%li'><![CDATA[%.*s]]></stderr>" // 44
-        "</localvars></result>", // 21
-        itemId,
-        res->errorLevel,
-        res->outLen,
-        (int) res->outLen,
-        res->out,
-        res->errLen,
-        (int) res->errLen,
-        res->err );
-    return msg;
-}
-
-char *item_cmd( xjr_node *item, char *itemIdStr ) {
-    char *cmd = xjr_node__get_valuez( item, "cmd", 3 );
-    
-    int itemId = atoi( itemIdStr );
-    free( itemIdStr );
-    
-    // Ensure the specified file exists and can be executed
-    if( access( cmd, X_OK ) == -1 ) {
-        char err[400];
-        sprintf(err,"error:File does not exist or is not executable '%s'", cmd );
-        return strdup( err );
-    }
-    
-    int argCount = 0;
-    char **args;
-    int argRes = xjr_to_args( xjr_node__getarr( item, "arg", 3 ), &argCount, &args );
-    if( argRes ) {
-        xjr_node__dump( item, 20 );
-        return strdup("error:no argument specified");
-    }
-    args[ 0 ] = cmd;
-    
-    char *in = NULL;
-    cmd_res *runRes = run_cmd( args, argCount, 0, in );
-    if( !runRes ) {
-        char *msg = form_response( itemId, runRes );
-        cmd_res__delete( runRes );
-        printf( msg );
-        free_args( args, argCount );
-        return msg;
-    }
-
-    return strdup("error:unknown");
 }
