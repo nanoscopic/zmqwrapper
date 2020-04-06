@@ -4,7 +4,9 @@
 #include<sys/wait.h>
 #include<stdlib.h>
 #include<stdio.h>
+#include<time.h>
 //#include<zmq.h> 
+#include"ujsonout.c"
 
 char **shift_args( char *argsIn[], int count, int shift );
 void run_cmd( void *sock, char **args, int argLen, long int *inLen, char *in );
@@ -35,7 +37,13 @@ void *init_zmq( char *spec ) {
 }
 
 void send_line( char *buffer, int len ) {
-    printf( "Line[%.*s]\n", len, buffer );
+    output *out = output__new();
+    output__add_json_str( out, "type", 4, "line", 4, 0 );
+    output__add_json_time( out, "time", 4, time(NULL), 0 );
+    output__add_json_str( out, "line", 4, buffer, len, 1 );
+    char *flat = output__endflatdel( out );
+    printf("JSON:%s\n", flat );
+    free( flat );
 }
 
 void send_lines( int type, void *sock, char **outPtr, int *outPos, int *outSize, int *increase ) {
